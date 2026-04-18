@@ -9,17 +9,48 @@ from typing import List
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
 from pydantic import BaseModel
+from supabase import create_client, Client
+import google.generativeai as genai  # Standard Google AI Import
+import httpx
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- SUPABASE CONFIG ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+# Handle both naming conventions for safety
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY")
+supabase: Client = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        # Ensure URL is formatted correctly for the client
+        url_to_use = SUPABASE_URL if SUPABASE_URL.startswith("http") else f"https://{SUPABASE_URL}.supabase.co"
+        supabase = create_client(url_to_use, SUPABASE_KEY)
+        logger.info("Supabase connected.")
+    except Exception as e:
+        logger.error(f"Failed to init Supabase: {e}")
+
+# --- GEMINI CONFIG ---
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_KEY:
+    try:
+        genai.configure(api_key=GEMINI_KEY)
+        # We use the model object directly in the new SDK
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+        logger.info("Gemini Client initialized.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini Client: {e}")
+        gemini_model = None
+else:
+    gemini_model = None
+    logger.warning("GEMINI_API_KEY missing. AI features will be disabled.")
+
 app = FastAPI(title="Project Aegis Backend")
 
-# Allow requests from frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,233 +59,246 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active WebSocket connections
 connected_clients: List[WebSocket] = []
 
-# Global Fleet State
+# --- FLEET STATE ---
 machines = [
-    {"id": "AEGIS-01", "location": "Sector 7"},
-    {"id": "AEGIS-02", "location": "Sector 3"},
-    {"id": "AEGIS-03", "location": "Lab B"},
-    {"id": "AEGIS-04", "location": "Loading Dock"}
+    {"id": "AEGIS-01", "malendau_id": "CNC_01", "location": "Sector 7", "target": 1480},
+    {"id": "AEGIS-02", "malendau_id": "CNC_02", "location": "Sector 3", "target": 1490},
+    {"id": "AEGIS-03", "malendau_id": "PUMP_03", "location": "Lab B", "target": 2950},
+    {"id": "AEGIS-04", "malendau_id": "CONVEYOR_04", "location": "Loading Dock", "target": 720}
 ]
 
 fleet_state = {}
 for m in machines:
     fleet_state[m["id"]] = {
         "status": "ACTIVE",
-        "temp": 65.0, "vib": 2.5, "rpm": 3200, "cur": 12.0,
-        "dt_ema": 0.0, "dv_ema": 0.0,
-        "prev_temp": 65.0, "prev_vib": 2.5,
-        "last_alert_time": 0, "last_alert_text": None
+        "stream_temp": 25.0, "stream_vib": 0.0, "stream_rpm": 0, "stream_cur": 0.0,
+        "malendau_status": "running",
+        "temp": 25.0, "vib": 0.0, "rpm": 0, "cur": 0.0,
+        "prev_temp": 25.0, "prev_vib": 0.0,
+        "last_alert_time": 0, "last_alert_text": None,
+        "history": [],
+        "alerts": []
     }
-
-# Initialize Gemini Client
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client = None
-if GEMINI_KEY and GEMINI_KEY != "YOUR_GEMINI_API_KEY_HERE":
-    try:
-        gemini_client = genai.Client(api_key=GEMINI_KEY)
-    except Exception as e:
-        logger.error(f"Failed to initialize Gemini Client: {e}")
 
 class SensorData(BaseModel):
     timestamp: str
     machine_id: str
     location: str
-    temperature: float # C
-    vibration: float   # mm/s
-    rpm: int           # revs/min
-    current: float     # Amps
-    risk_score: float  # 0 to 100
-    rul: str           # Remaining Useful Life
+    temperature: float
+    vibration: float
+    rpm: int
+    current: float
+    risk_score: float
+    rul: str
     status: str = "ACTIVE"
 
 class ReportRequest(BaseModel):
     alert_text: str
     sensor_data: dict
 
-def check_anomaly(data: SensorData) -> bool:
-    """Simple heuristic to detect anomalies."""
-    if data.temperature > 85.0: return True
-    if data.vibration > 6.0: return True
-    if data.rpm < 2800 or data.rpm > 3600: return True
-    if data.current > 18.0: return True
+def calculate_risk_score(temp: float, vib: float, malendau_status: str) -> float:
+    risk = random.uniform(2.0, 8.0) # Base dynamic drift
+    if malendau_status == "fault":
+        risk += random.uniform(80.0, 95.0)
+    elif malendau_status == "warning":
+        risk += random.uniform(40.0, 60.0)
+    else:
+        if temp > 75: risk += (temp - 75) * 1.2
+        if vib > 4.0: risk += (vib - 4.0) * 8.0
+    return round(min(100.0, max(0.0, risk)), 1)
+
+def check_anomaly(data: SensorData, malendau_status: str) -> bool:
+    if malendau_status in ["warning", "fault"]: return True
+    if data.temperature > 100.0 or data.vibration > 5.0: return True
     return False
 
-def calculate_risk_score(temp: float, vib: float, rpm: int, cur: float) -> float:
-    risk = 0.0
-    if temp > 80: risk += (temp - 80) * 2
-    if vib > 5: risk += (vib - 5) * 10
-    if abs(rpm - 3200) > 200: risk += abs(rpm - 3200) * 0.05
-    if cur > 15: risk += (cur - 15) * 5
-    return min(100.0, max(0.0, risk))
-
 async def generate_alert_with_gemini(data: SensorData) -> str:
-    """Use Gemini API to generate an English alert based on the sensor anomaly."""
-    if not gemini_client:
-        return "CRITICAL ALERT: System parameters exceeded normal operating bounds. (Gemini API not configured)"
+    if not gemini_model:
+        return "CRITICAL ALERT: System parameters exceeded normal operating bounds."
     
     prompt = f"""
-    You are an AI diagnostic agent in an industrial control room. A system anomaly has just been detected.
-    Here is the live sensor data:
-    - Temperature: {data.temperature:.1f} °C (Normal: < 80 °C)
-    - Vibration: {data.vibration:.2f} mm/s (Normal: < 5 mm/s)
-    - RPM: {data.rpm} (Normal: 3000-3400)
-    - Current: {data.current:.1f} A (Normal: < 15 A)
-    - Calculated Risk Score: {data.risk_score:.0f}/100
-
-    Write a single, concise professional alert message (maximum 2 sentences) describing what looks broken or dangerous.
-    Do not use introductory filler. Keep it urgent but professional.
+    Industrial Control Room Alert. Sensor data:
+    Temp: {data.temperature:.1f}C, Vib: {data.vibration:.2f}mm/s, RPM: {data.rpm}, Risk: {data.risk_score:.0f}/100.
+    Write a 1-sentence urgent professional alert message. No filler.
     """
     try:
-        # Run synchronous generate_content in a thread to wait without blocking loop if needed
-        # Or just use the native interface
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
+        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
         return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
-        return "CRITICAL ALERT: Unknown anomaly detected and failed to generate analysis."
+        return "CRITICAL ALERT: Unknown anomaly detected."
+
+async def stream_machine(machine_id: str, malendau_id: str):
+    async with httpx.AsyncClient(timeout=None) as client:
+        while True:
+            try:
+                logger.info(f"Connecting to Malendau stream: {malendau_id}")
+                async with client.stream('GET', f'http://localhost:3000/stream/{malendau_id}') as response:
+                    async for line in response.aiter_lines():
+                        if line.startswith('data: '):
+                            data = json.loads(line[6:])
+                            s = fleet_state[machine_id]
+                            s['stream_temp'] = data['temperature_C']
+                            s['stream_vib'] = data['vibration_mm_s']
+                            s['stream_rpm'] = data['rpm']
+                            s['stream_cur'] = data['current_A']
+                            s['malendau_status'] = data['status']
+            except Exception as e:
+                logger.error(f"Stream error {malendau_id}: {e}")
+                await asyncio.sleep(5)
 
 async def sensor_data_loop():
-    """Background task to simulate data and broadcast it."""
+    global supabase
     while True:
         try:
-            payload_array = []
+            if supabase is None and SUPABASE_URL and SUPABASE_KEY:
+                try:
+                    url_to_use = SUPABASE_URL if SUPABASE_URL.startswith("http") else f"https://{SUPABASE_URL}.supabase.co"
+                    supabase = create_client(url_to_use, SUPABASE_KEY)
+                    logger.info("Supabase re-connected.")
+                except Exception as e:
+                    logger.error(f"Failed to re-init Supabase: {e}")
+
+            if supabase:
+                try:
+                    res = supabase.table("machines").select("machineId, status").execute()
+                    for dbm in res.data:
+                        dbm_id = dbm.get("machineId") or dbm.get("machineid") or dbm.get("id")
+                        if dbm_id in fleet_state:
+                            fleet_state[dbm_id]["status"] = dbm.get("status", fleet_state[dbm_id]["status"])
+                except Exception as e:
+                    logger.error(f"DB Sync Error: {e}")
+
             current_time = asyncio.get_event_loop().time()
             
             for m in machines:
                 mid = m["id"]
                 s = fleet_state[mid]
                 
+                print(f"Syncing {mid}: Status is {s['status']}")
+                
+                # Logic for status processing
                 if s["status"] == "OFFLINE":
-                    # Data is frozen at 0
-                    risk = 0.0
-                    rul_str = "OFFLINE"
+                    s["rpm"] = 0; s["temp"] = 20.0; s["vib"] = 0.0; s["cur"] = 0.0
+                    risk = 0.0; rul_str = "OFFLINE"
                 elif s["status"] == "THROTTLED":
-                    # Cap RPM, decay temp and vib
-                    s["rpm"] = min(s["rpm"], 1500)
-                    if s["temp"] > 40: s["temp"] -= 0.5
-                    if s["vib"] > 1: s["vib"] -= 0.1
-                    if s["cur"] > 5: s["cur"] -= 0.2
-                    
-                    s["temp"] += random.uniform(-0.2, 0.2)
-                    s["vib"] += random.uniform(-0.05, 0.05)
-                    s["rpm"] += random.randint(-10, 10)
-                    s["rpm"] = min(s["rpm"], 1500)
-                    
-                    s["temp"] = max(20.0, s["temp"])
-                    s["vib"] = max(0.1, s["vib"])
-                    s["rpm"] = max(0, s["rpm"])
-                    s["cur"] = max(0.1, s["cur"])
-                    
-                    risk = calculate_risk_score(s["temp"], s["vib"], s["rpm"], s["cur"])
-                    rul_str = ">99h 59m"
+                    s["rpm"] = min(s.get("stream_rpm", 0), 1000)
+                    s["temp"] = max(25.0, s.get("stream_temp", 25.0) - 10.0)
+                    s["vib"] = max(0.5, s.get("stream_vib", 0.5) - 1.0)
+                    s["cur"] = s.get("stream_cur", 0)
+                    risk, rul_str = 15.0, ">99h 59m"
                 else: # ACTIVE
-                    # Simulate normal fluctuations
-                    s["temp"] += random.uniform(-1, 1)
-                    s["vib"] += random.uniform(-0.2, 0.2)
-                    s["rpm"] += random.randint(-50, 50)
-                    s["cur"] += random.uniform(-0.5, 0.5)
-                    
-                    # Occasionally cause a spike
-                    if random.random() < 0.02:  # 2% chance for each machine
-                        s["temp"] += random.uniform(5, 20)
-                        s["vib"] += random.uniform(2, 5)
-                        s["cur"] += random.uniform(2, 6)
+                    s["temp"] = s.get("stream_temp", s["temp"])
+                    s["vib"] = s.get("stream_vib", s["vib"])
+                    s["rpm"] = s.get("stream_rpm", s["rpm"])
+                    s["cur"] = s.get("stream_cur", s["cur"])
+                    risk = calculate_risk_score(s["temp"], s["vib"], s.get("malendau_status", "running"))
+                    rul_str = f"{random.randint(40, 48)}h {random.randint(10, 59)}m" if s.get("malendau_status") == "running" else "URGENT MAINT"
 
-                    s["temp"] = max(20.0, s["temp"])
-                    s["vib"] = max(0.1, s["vib"])
-                    s["rpm"] = max(0, s["rpm"])
-                    s["cur"] = max(0.1, s["cur"])
-                    
-                    # Decay towards normal
-                    if s["temp"] > 80: s["temp"] -= 1
-                    if s["vib"] > 5: s["vib"] -= 0.5
-                    if s["cur"] > 15: s["cur"] -= 0.5
-                    if s["rpm"] < 3000: s["rpm"] += 50
-                    if s["rpm"] > 3400: s["rpm"] -= 50
-
-                    risk = calculate_risk_score(s["temp"], s["vib"], s["rpm"], s["cur"])
-                
-                if s["status"] == "ACTIVE":
-                    dt = s["temp"] - s["prev_temp"]
-                    dv = s["vib"] - s["prev_vib"]
-                    s["prev_temp"] = s["temp"]
-                    s["prev_vib"] = s["vib"]
-                    
-                    alpha = 0.2
-                    s["dt_ema"] = alpha * dt + (1 - alpha) * s["dt_ema"]
-                    s["dv_ema"] = alpha * dv + (1 - alpha) * s["dv_ema"]
-                    
-                    rul_seconds = 9999999
-                    if s["dt_ema"] > 0.05:
-                        rul_seconds = min(rul_seconds, (100 - s["temp"]) / s["dt_ema"])
-                    if s["dv_ema"] > 0.05:
-                        rul_seconds = min(rul_seconds, (10 - s["vib"]) / s["dv_ema"])
-                        
-                    if rul_seconds == 9999999 or rul_seconds < 0:
-                        rul_str = ">99h 59m"
-                    else:
-                        total_minutes = int(rul_seconds)
-                        hours = total_minutes // 60
-                        mins = total_minutes % 60
-                        rul_str = ">99h 59m" if hours > 99 else f"{hours}h {mins:02d}m"
-                
                 data = SensorData(
                     timestamp=datetime.utcnow().isoformat() + "Z",
-                    machine_id=mid,
-                    location=m["location"],
-                    temperature=s["temp"],
-                    vibration=s["vib"],
-                    rpm=s["rpm"],
-                    current=s["cur"],
-                    risk_score=risk,
-                    rul=rul_str,
-                    status=s["status"]
+                    machine_id=mid, location=m["location"],
+                    temperature=s["temp"], vibration=s["vib"],
+                    rpm=s["rpm"], current=s["cur"],
+                    risk_score=risk, rul=rul_str, status=s["status"]
                 )
-                
-                item_payload = data.model_dump()
-                
-                if s["status"] == "ACTIVE" and check_anomaly(data):
-                    if current_time - s["last_alert_time"] > 60:
-                        alert_text = await generate_alert_with_gemini(data)
-                        s["last_alert_text"] = alert_text
-                        s["last_alert_time"] = current_time
-                    else:
-                        alert_text = s["last_alert_text"] or "CRITICAL ALERT: System parameters exceeded normal operating bounds (rate limited)."
-                    item_payload['alert'] = alert_text
-                else:
-                    item_payload['alert'] = None
-                    s["last_alert_text"] = None
-                    
-                payload_array.append(item_payload)
-                
-            # Broadcast to all connected clients
-            disconnected_clients = []
-            for client in connected_clients:
-                try:
-                    await client.send_text(json.dumps(payload_array))
-                except WebSocketDisconnect:
-                    disconnected_clients.append(client)
-                except Exception as e:
-                    logger.error(f"Could not send data to client: {e}")
-                    disconnected_clients.append(client)
-                    
-            for client in disconnected_clients:
-                connected_clients.remove(client)
-                
-            await asyncio.sleep(1) # Broadcast every second
+
+                # History and Alert Tracking
+                time_str = datetime.now().strftime("%H:%M:%S")
+                point = {"time": time_str, "temperature_C": round(s["temp"], 1), "vibration_mm_s": round(s["vib"], 2), "rpm": int(s["rpm"])}
+                s["history"].append(point)
+                if len(s["history"]) > 20: s["history"].pop(0)
+
+                # High Risk Detection & Maintenance Logs Hook
+                if s["status"] == "ACTIVE" and risk > 60.0:
+                    # Use -1000 to ensure the first trigger doesn't wait 60s of server uptime
+                    if current_time - s.get("last_log_time", -1000) > 60:
+                        s["last_log_time"] = current_time
+                        
+                        print('DEBUG: Attempting AI Log Insert for ' + mid)
+                        
+                        prompt = f"""
+                        Analyze this machine state: Temp {s['temp']:.1f}C, Vib {s['vib']:.2f}mm/s, RPM {s['rpm']}, Risk {risk:.0f}/100.
+                        Output exactly valid JSON. Do not include markdown formatting or backticks. Schema: {{"issue_type": "Brief issue name", "reasoning": "Short explainable AI reasoning", "confidence": 0.85}}
+                        """
+                        try:
+                            response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+                            payload = json.loads(response.text.replace('```json', '').replace('```', '').strip())
+                            issue_type = payload.get("issue_type", "Unknown Anomaly")
+                            reasoning = payload.get("reasoning", "Parameter deviation detected.")
+                            confidence = float(payload.get("confidence", 0.5))
+                        except Exception as e:
+                            print(f"[ERROR] Gemini Parse failed: {e}")
+                            issue_type = "Thermal/Vibration Spike"
+                            reasoning = "Critical Thermal/Vibration Spike Detected"
+                            confidence = 0.90
+                            
+                        # Confidence Threshold System
+                        if confidence > 0.8:
+                            risk_level = "CRITICAL"
+                        elif confidence >= 0.6:
+                            risk_level = "WARNING"
+                        else:
+                            risk_level = "ANOMALY"
+                            
+                        # Update Machine Alerts for Frontend Payload Sync
+                        alert = {"time": time_str, "text": reasoning, "severity": risk_level.lower()}
+                        s["alerts"].insert(0, alert)
+                        if len(s["alerts"]) > 10:
+                            s["alerts"].pop()
+
+                        if supabase:
+                            try:
+                                log_entry = {
+                                    "machine_id": mid,
+                                    "technician_name": random.choice(["Shiv Sai", "Prasanna"]),
+                                    "issue_type": issue_type,
+                                    "risk_level": risk_level,
+                                    "confidence": confidence,
+                                    "reasoning": reasoning
+                                }
+                                await asyncio.to_thread(supabase.table("maintenance_logs").insert(log_entry).execute)
+                                print(f"[SUCCESS] AI Insert to maintenance_logs for {mid} | Conf: {confidence}")
+                            except Exception as e:
+                                print(f"[ERROR] Failed AI insert to maintenance_logs: {e}")
+                                logger.error(f"Failed to auto-spawn log: {e}")
+
+                # DB UPSERT
+                if supabase:
+                    record = {
+                        "machineId": mid, "location": m["location"], "status": s["status"],
+                        "efficiency": max(60, int(100 - (s["vib"] * 5))), "currentScore": risk,
+                        "rul": rul_str, "targetOutput": m["target"], "actualOutput": s["rpm"],
+                        "history": json.dumps(s["history"]), "alerts": json.dumps(s["alerts"][:10])
+                    }
+                    print(f"Upserting: {record['machineId']} | Status: {record['status']} | Score: {record['currentScore']:.1f}")
+                    try:
+                        await asyncio.to_thread(supabase.table("machines").upsert(record).execute)
+                    except ConnectionError:
+                        logger.warning('Connection lost, retrying in 5s...')
+                        supabase = None
+                        await asyncio.sleep(5)
+                        break
+                    except Exception as e:
+                        if "HTTPError" in type(e).__name__ or "10054" in str(e):
+                            logger.warning('Connection lost, retrying in 5s...')
+                            supabase = None
+                            await asyncio.sleep(5)
+                            break
+                        else:
+                            logger.error(f"DB Upsert Error: {e}")
+
+            await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"Error in sensor loop: {e}")
-            await asyncio.sleep(1)
+            logger.error(f"Loop Error: {e}")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup_event():
+    for m in machines:
+        asyncio.create_task(stream_machine(m["id"], m["malendau_id"]))
     asyncio.create_task(sensor_data_loop())
 
 @app.websocket("/ws/sensors")
@@ -263,100 +307,24 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_clients.append(websocket)
     try:
         while True:
-            # Listen for incoming commands
             data = await websocket.receive_text()
-            try:
-                msg = json.loads(data)
-                if msg.get("type") == "COMMAND":
-                    mid = msg.get("machine_id")
-                    action = msg.get("action")
-                    if mid in fleet_state:
-                        if action == "KILL":
-                            fleet_state[mid]["status"] = "OFFLINE"
-                            fleet_state[mid]["rpm"] = 0
-                            fleet_state[mid]["temp"] = 0
-                            fleet_state[mid]["vib"] = 0
-                            fleet_state[mid]["cur"] = 0
-                            logger.info(f"KILL command executed on {mid}")
-                        elif action == "LIMIT_RPM":
-                            fleet_state[mid]["status"] = "THROTTLED"
-                            logger.info(f"LIMIT_RPM command executed on {mid}")
-            except Exception as e:
-                logger.error(f"Error parsing command: {e}")
+            msg = json.loads(data)
+            if msg.get("type") == "COMMAND":
+                mid, action = msg.get("machine_id"), msg.get("action")
+                if mid in fleet_state:
+                    fleet_state[mid]["status"] = "OFFLINE" if action == "KILL" else "THROTTLED"
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
-    finally:
-        if websocket in connected_clients:
-            connected_clients.remove(websocket)
+        connected_clients.remove(websocket)
 
 @app.post("/generate-report")
 async def generate_report(req: ReportRequest):
-    if not gemini_client:
-        return {"error": "Gemini API not configured"}
-
-    machine_id = req.sensor_data.get("machine_id", "AEGIS-UNIT-01")
-    location = req.sensor_data.get("location", "Sector 7")
-
-    prompt = f"""
-    You are generating a maintenance ticket for Machine ID: {machine_id} located in {location}.
-    Based on the following AI diagnosis and sensor data, generate a structured maintenance ticket in JSON format unique to this unit.
-    Include a 'Financial Impact' analysis. Estimate the cost of the parts saved (e.g., Bearings: $2k, Motor: $8k) and the value of the downtime prevented based on a $5,000/hour factory operating cost.
-    
-    Diagnosis: {req.alert_text}
-    Data: {json.dumps(req.sensor_data)}
-    
-    Return EXACTLY a JSON object with NO markdown formatting, with the following keys:
-    "ticket_id" (e.g. "TKT-{random.randint(1000, 9999)}"),
-    "equipment_id" (use "{machine_id}"),
-    "location" (use "{location}"),
-    "priority" ("High", "MEDIUM", "Low"),
-    "diagnosis_summary" (string),
-    "recommended_actions" (list of strings),
-    "financial_impact_analysis" (string, explaining the cost savings),
-    "estimated_financial_recovery" (string, formatted as currency e.g. "$12,400.00").
-    """
+    if not gemini_model: return {"error": "AI disabled"}
+    prompt = f"Generate a structured maintenance JSON for {req.sensor_data['machine_id']}. Issue: {req.alert_text}. Include 'estimated_financial_recovery'."
     try:
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        text = response.text.strip()
-        if text.startswith("```json"): text = text[7:]
-        if text.startswith("```"): text = text[3:]
-        if text.endswith("```"): text = text[:-3]
-        return json.loads(text.strip())
-    except Exception as e:
-        logger.error(f"Generate Report Error: {e}")
-        
-        temp = req.sensor_data.get("temperature", 0)
-        vib = req.sensor_data.get("vibration", 0)
-        rpm = req.sensor_data.get("rpm", 0)
-
-        fallback_diagnosis = "Unknown anomaly detected."
-        if temp > 80:
-            fallback_diagnosis = "Thermal stress detected."
-        elif vib > 5:
-            fallback_diagnosis = "Mechanical imbalance detected."
-        elif rpm > 3400:
-            fallback_diagnosis = "Over-speed condition detected."
-
-        ticket_id = f"TIC-{machine_id}-{random.randint(1000, 9999)}"
-
-        return {
-            "ticket_id": ticket_id,
-            "equipment_id": machine_id,
-            "location": location,
-            "priority": "CRITICAL",
-            "diagnosis_summary": fallback_diagnosis,
-            "recommended_actions": [
-                "1. Immediate Emergency Stop.",
-                "2. Perform manual inspection.",
-                "3. Refer to standard operating procedures."
-            ],
-            "financial_impact_analysis": "Fallback: Estimated $2,000 parts replaced and $5,000 downtime prevented.",
-            "estimated_financial_recovery": "$7,000.00"
-        }
+        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        return json.loads(response.text.replace('```json', '').replace('```', '').strip())
+    except:
+        return {"ticket_id": "TKT-ERR", "priority": "HIGH", "diagnosis_summary": "Manual review required."}
 
 if __name__ == "__main__":
     import uvicorn
